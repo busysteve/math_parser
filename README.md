@@ -1,4 +1,4 @@
-# Dynamic C++ Math Formula Parser
+# Dynamic C++ Runtime Math Formula Parser
 
 `MathFormula` compiles an expression once and evaluates it repeatedly. Variable names are discovered from the expression; the C++ application does not need a hard-coded list.
 
