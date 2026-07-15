@@ -9,7 +9,6 @@
 #include <functional>
 #include <limits>
 #include <numbers>
-#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -39,8 +38,6 @@ public:
     };
 
     using NativeFunction = std::function<double(std::span<const double>)>;
-    using VariableMap = std::unordered_map<std::string, double>;
-    using VariableResolver = std::function<std::optional<double>(std::string_view)>;
 
     MathFormula() {
         registerConstant("pi", std::numbers::pi_v<double>);
@@ -144,118 +141,48 @@ public:
         maximumStackDepth_ = calculateMaximumStackDepth();
     }
 
-    // Loads both the expression and all variable values from a configuration file.
-    //
-    // Example:
-    //   formula = subtotal * (1 + tax_rate) - discount
-    //
-    //   [variables]
-    //   subtotal = 120.0
-    //   tax_rate = 0.07
-    //   discount = 10.0
-    //
-    // Variables may also be written as var.name=value or variable.name=value.
-    void loadFromConfig(
-        const std::filesystem::path& file,
-        std::string_view formulaKey = "formula") {
-
-        ConfigurationData configuration = readConfiguration(file, formulaKey, true);
-        compile(std::move(configuration.formula));
-        setVariables(std::move(configuration.variables), true);
-    }
-
-    // Backward-compatible name. It now loads configured variable values too.
+    // Minimal key=value configuration loader. For JSON/TOML/YAML, get the
+    // formula string with that library and pass it to compile().
     void compileFromConfig(
         const std::filesystem::path& file,
         std::string_view key = "formula") {
-        loadFromConfig(file, key);
-    }
 
-    // Reloads only values, leaving the compiled expression untouched. This is
-    // useful when a configuration file changes while the program is running.
-    void loadVariablesFromConfig(
-        const std::filesystem::path& file,
-        bool replaceExisting = false,
-        std::string_view formulaKey = "formula") {
-
-        ConfigurationData configuration = readConfiguration(file, formulaKey, false);
-        setVariables(std::move(configuration.variables), replaceExisting);
-    }
-
-    void setVariable(std::string name, double value) {
-        validateVariableName(name);
-        runtimeVariables_[std::move(name)] = value;
-    }
-
-    void setVariables(VariableMap values, bool replaceExisting = false) {
-        for (const auto& [name, value] : values) {
-            (void)value;
-            validateVariableName(name);
+        std::ifstream input(file);
+        if (!input) {
+            throw std::runtime_error("Could not open configuration file: " + file.string());
         }
 
-        if (replaceExisting) {
-            runtimeVariables_ = std::move(values);
+        std::string line;
+        while (std::getline(input, line)) {
+            const std::string_view trimmed = trim(line);
+            if (trimmed.empty() || trimmed.front() == '#' || trimmed.front() == ';') {
+                continue;
+            }
+
+            const std::size_t equals = trimmed.find('=');
+            if (equals == std::string_view::npos) {
+                continue;
+            }
+
+            const std::string_view foundKey = trim(trimmed.substr(0, equals));
+            if (foundKey != key) {
+                continue;
+            }
+
+            std::string_view value = trim(trimmed.substr(equals + 1));
+            if (value.size() >= 2 &&
+                ((value.front() == '"' && value.back() == '"') ||
+                 (value.front() == '\'' && value.back() == '\''))) {
+                value.remove_prefix(1);
+                value.remove_suffix(1);
+            }
+
+            compile(std::string(value));
             return;
         }
 
-        for (auto& [name, value] : values) {
-            runtimeVariables_[std::move(name)] = value;
-        }
-    }
-
-    [[nodiscard]] bool hasVariableValue(std::string_view name) const {
-        return runtimeVariables_.find(std::string(name)) != runtimeVariables_.end();
-    }
-
-    [[nodiscard]] double variableValue(std::string_view name) const {
-        const auto found = runtimeVariables_.find(std::string(name));
-        if (found == runtimeVariables_.end()) {
-            throw std::out_of_range("No runtime value exists for variable: " + std::string(name));
-        }
-        return found->second;
-    }
-
-    bool removeVariableValue(std::string_view name) {
-        return runtimeVariables_.erase(std::string(name)) != 0;
-    }
-
-    void clearVariableValues() noexcept { runtimeVariables_.clear(); }
-
-    [[nodiscard]] const VariableMap& variableValues() const noexcept {
-        return runtimeVariables_;
-    }
-
-    // A resolver can fetch values from sensors, a database, environment
-    // variables, a scripting system, or any other runtime source. It is used
-    // only when a value is not present in runtimeVariables_.
-    void setVariableResolver(VariableResolver resolver) {
-        variableResolver_ = std::move(resolver);
-    }
-
-    void clearVariableResolver() { variableResolver_ = {}; }
-
-    // Evaluates with values previously loaded from configuration or supplied
-    // through setVariable()/setVariables(). No variable names are hard-coded
-    // by the caller.
-    [[nodiscard]] double evaluate() const {
-        return evaluateResolved([this](std::string_view name) -> std::optional<double> {
-            const auto found = runtimeVariables_.find(std::string(name));
-            if (found != runtimeVariables_.end()) {
-                return found->second;
-            }
-            if (variableResolver_) {
-                return variableResolver_(name);
-            }
-            return std::nullopt;
-        });
-    }
-
-    // Evaluates directly against any dynamic value source.
-    [[nodiscard]] double evaluate(const VariableResolver& resolver) const {
-        if (!resolver) {
-            throw std::invalid_argument("Variable resolver cannot be empty");
-        }
-        return evaluateResolved(resolver);
+        throw std::runtime_error(
+            "Configuration key '" + std::string(key) + "' was not found in " + file.string());
     }
 
     [[nodiscard]] double evaluate(std::span<const double> variableValues) const {
@@ -359,7 +286,8 @@ public:
         return stack.back();
     }
 
-    [[nodiscard]] double evaluate(const VariableMap& variables) const {
+    [[nodiscard]] double evaluate(
+        const std::unordered_map<std::string, double>& variables) const {
 
         std::vector<double> orderedValues(variableNames_.size());
         for (std::size_t i = 0; i < variableNames_.size(); ++i) {
@@ -370,20 +298,6 @@ public:
             orderedValues[i] = found->second;
         }
         return evaluate(orderedValues);
-    }
-
-    [[nodiscard]] std::vector<std::string> missingVariables() const {
-        std::vector<std::string> missing;
-        for (const std::string& name : variableNames_) {
-            if (runtimeVariables_.find(name) != runtimeVariables_.end()) {
-                continue;
-            }
-            if (variableResolver_ && variableResolver_(name).has_value()) {
-                continue;
-            }
-            missing.push_back(name);
-        }
-        return missing;
     }
 
     [[nodiscard]] std::size_t variableIndex(std::string_view name) const {
@@ -401,28 +315,6 @@ public:
     [[nodiscard]] const std::string& source() const noexcept { return source_; }
 
 private:
-    struct ConfigurationData {
-        std::string formula;
-        VariableMap variables;
-    };
-
-    [[nodiscard]] double evaluateResolved(const VariableResolver& resolver) const {
-        if (code_.empty()) {
-            throw EvaluationError("No formula has been compiled");
-        }
-
-        std::vector<double> orderedValues;
-        orderedValues.reserve(variableNames_.size());
-        for (const std::string& name : variableNames_) {
-            const std::optional<double> value = resolver(name);
-            if (!value.has_value()) {
-                throw EvaluationError("Missing variable: " + name);
-            }
-            orderedValues.push_back(*value);
-        }
-        return evaluate(orderedValues);
-    }
-
     enum class Operation : std::uint8_t {
         PushConstant,
         PushVariable,
@@ -822,113 +714,6 @@ private:
             });
     }
 
-    static ConfigurationData readConfiguration(
-        const std::filesystem::path& file,
-        std::string_view formulaKey,
-        bool requireFormula) {
-
-        std::ifstream input(file);
-        if (!input) {
-            throw std::runtime_error("Could not open configuration file: " + file.string());
-        }
-
-        ConfigurationData result;
-        bool formulaFound = false;
-        std::string section;
-        std::string line;
-        std::size_t lineNumber = 0;
-
-        while (std::getline(input, line)) {
-            ++lineNumber;
-            std::string_view text = trim(line);
-            if (text.empty() || text.front() == '#' || text.front() == ';') {
-                continue;
-            }
-
-            if (text.size() >= 2 && text.front() == '[' && text.back() == ']') {
-                section = std::string(trim(text.substr(1, text.size() - 2)));
-                continue;
-            }
-
-            const std::size_t equals = text.find('=');
-            if (equals == std::string_view::npos) {
-                throw std::runtime_error(
-                    "Expected key=value in " + file.string() +
-                    " at line " + std::to_string(lineNumber));
-            }
-
-            std::string key(trim(text.substr(0, equals)));
-            std::string value(unquote(trim(text.substr(equals + 1))));
-
-            if (key == formulaKey) {
-                result.formula = std::move(value);
-                formulaFound = true;
-                continue;
-            }
-
-            std::string variableName;
-            if (section == "variables") {
-                variableName = std::move(key);
-            } else if (key.starts_with("var.")) {
-                variableName = key.substr(4);
-            } else if (key.starts_with("variable.")) {
-                variableName = key.substr(9);
-            } else {
-                // Ignore unrelated application settings.
-                continue;
-            }
-
-            validateIdentifier(variableName);
-            result.variables[std::move(variableName)] =
-                parseConfiguredNumber(value, file, lineNumber);
-        }
-
-        if (requireFormula && !formulaFound) {
-            throw std::runtime_error(
-                "Configuration key '" + std::string(formulaKey) +
-                "' was not found in " + file.string());
-        }
-        return result;
-    }
-
-    static std::string_view unquote(std::string_view value) {
-        if (value.size() >= 2 &&
-            ((value.front() == '"' && value.back() == '"') ||
-             (value.front() == '\'' && value.back() == '\''))) {
-            value.remove_prefix(1);
-            value.remove_suffix(1);
-        }
-        return value;
-    }
-
-    static double parseConfiguredNumber(
-        std::string_view text,
-        const std::filesystem::path& file,
-        std::size_t lineNumber) {
-
-        const std::string value(trim(text));
-        try {
-            std::size_t consumed = 0;
-            const double number = std::stod(value, &consumed);
-            if (consumed != value.size()) {
-                throw std::invalid_argument("trailing characters");
-            }
-            return number;
-        } catch (const std::exception&) {
-            throw std::runtime_error(
-                "Invalid numeric variable value '" + value + "' in " +
-                file.string() + " at line " + std::to_string(lineNumber));
-        }
-    }
-
-    void validateVariableName(std::string_view name) const {
-        validateIdentifier(name);
-        if (constants_.find(std::string(name)) != constants_.end()) {
-            throw std::invalid_argument(
-                "Variable name conflicts with a registered constant: " + std::string(name));
-        }
-    }
-
     static void validateIdentifier(std::string_view name) {
         if (name.empty() ||
             !(std::isalpha(static_cast<unsigned char>(name.front())) || name.front() == '_')) {
@@ -990,8 +775,4 @@ private:
     std::vector<std::string> variableNames_;
     std::unordered_map<std::string, std::size_t> variableLookup_;
     std::size_t maximumStackDepth_{};
-
-    VariableMap runtimeVariables_;
-    VariableResolver variableResolver_;
 };
-
