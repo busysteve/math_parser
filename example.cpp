@@ -1,59 +1,51 @@
 #include "math_formula.hpp"
 
 #include <iostream>
-#include <stdexcept>
-#include <string>
-#include <string_view>
+#include <span>
+#include <unordered_map>
+#include <vector>
 
-namespace {
-void applyCommandLineAssignment(MathFormula& formula, std::string_view assignment) {
-    const std::size_t equals = assignment.find('=');
-    if (equals == std::string_view::npos) {
-        throw std::invalid_argument(
-            "Runtime overrides must use name=value: " + std::string(assignment));
-    }
-
-    const std::string name(assignment.substr(0, equals));
-    const std::string text(assignment.substr(equals + 1));
-
-    std::size_t consumed = 0;
-    const double value = std::stod(text, &consumed);
-    if (consumed != text.size()) {
-        throw std::invalid_argument("Invalid value in override: " + std::string(assignment));
-    }
-
-    // The name comes from runtime input; the program has no compiled-in list
-    // of variables.
-    formula.setVariable(name, value);
-}
-} // namespace
-
-int main(int argc, char* argv[]) {
+int main() {
     try {
-        const std::string configPath = argc > 1 ? argv[1] : "settings.ini";
-
         MathFormula formula;
-        formula.loadFromConfig(configPath);
 
-        // Optional runtime overrides are also completely dynamic:
-        //   ./formula_example settings.ini subtotal=250 discount=15
-        for (int i = 2; i < argc; ++i) {
-            applyCommandLineAssignment(formula, argv[i]);
+        // Optional application-defined function.
+        formula.registerFunction("lerp", 3, 3, [](std::span<const double> a) {
+            return a[0] + (a[1] - a[0]) * a[2];
+        });
+
+        // Or use:
+        // formula.compileFromConfig("settings.ini", "formula");
+        formula.compile("clamp(base * (1 + rate)^years + sin(t), 0, limit)");
+
+        // Convenient evaluation using names.
+        const std::unordered_map<std::string, double> variables{
+            {"base", 1000.0},
+            {"rate", 0.05},
+            {"years", 10.0},
+            {"t", 0.5},
+            {"limit", 2000.0}
+        };
+        std::cout << "Named evaluation: " << formula.evaluate(variables) << '\n';
+
+        // Faster repeated evaluation: resolve variable indexes once.
+        std::vector<double> runtimeValues(formula.variables().size());
+        const auto baseIndex = formula.variableIndex("base");
+        const auto rateIndex = formula.variableIndex("rate");
+        const auto yearsIndex = formula.variableIndex("years");
+        const auto timeIndex = formula.variableIndex("t");
+        const auto limitIndex = formula.variableIndex("limit");
+
+        runtimeValues[baseIndex] = 1000.0;
+        runtimeValues[rateIndex] = 0.05;
+        runtimeValues[yearsIndex] = 10.0;
+        runtimeValues[limitIndex] = 2000.0;
+
+        for (int frame = 0; frame < 5; ++frame) {
+            runtimeValues[timeIndex] = frame * 0.1;
+            std::cout << "Frame " << frame << ": "
+                      << formula.evaluate(runtimeValues) << '\n';
         }
-
-        std::cout << "Formula: " << formula.source() << "\n";
-        std::cout << "Discovered variables:\n";
-        for (const std::string& name : formula.variables()) {
-            std::cout << "  " << name;
-            if (formula.hasVariableValue(name)) {
-                std::cout << " = " << formula.variableValue(name);
-            } else {
-                std::cout << " = <missing>";
-            }
-            std::cout << '\n';
-        }
-
-        std::cout << "Result: " << formula.evaluate() << '\n';
     } catch (const MathFormula::CompileError& error) {
         std::cerr << "Formula error: " << error.what() << '\n';
         return 1;
