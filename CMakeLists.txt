@@ -1,9 +1,19 @@
-cmake_minimum_required(VERSION 3.20)
-project(math_formula_example LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.16)
+project(dynamic_formula_engine LANGUAGES CXX)
 
-add_executable(math_formula_example example.cpp)
-target_compile_features(math_formula_example PRIVATE cxx_std_20)
-target_compile_options(math_formula_example PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
+add_executable(formula_example example.cpp)
+target_compile_features(formula_example PRIVATE cxx_std_20)
+
+add_executable(formula_tests tests.cpp)
+target_compile_features(formula_tests PRIVATE cxx_std_20)
+
+foreach(target formula_example formula_tests)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endforeach()
+
+enable_testing()
+add_test(NAME formula_tests COMMAND formula_tests)

@@ -9,15 +9,19 @@
 #include <functional>
 #include <limits>
 #include <numbers>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+// Compiles one mathematical expression into compact stack-machine bytecode.
+// Use FormulaEngine below when named variables may themselves be expressions.
 class MathFormula {
 public:
     class CompileError : public std::runtime_error {
@@ -41,7 +45,7 @@ public:
 
     MathFormula() {
         registerConstant("pi", std::numbers::pi_v<double>);
-        registerConstant("e",  std::numbers::e_v<double>);
+        registerConstant("e", std::numbers::e_v<double>);
 
         registerUnary("sin",   [](double x) { return std::sin(x); });
         registerUnary("cos",   [](double x) { return std::cos(x); });
@@ -141,50 +145,6 @@ public:
         maximumStackDepth_ = calculateMaximumStackDepth();
     }
 
-    // Minimal key=value configuration loader. For JSON/TOML/YAML, get the
-    // formula string with that library and pass it to compile().
-    void compileFromConfig(
-        const std::filesystem::path& file,
-        std::string_view key = "formula") {
-
-        std::ifstream input(file);
-        if (!input) {
-            throw std::runtime_error("Could not open configuration file: " + file.string());
-        }
-
-        std::string line;
-        while (std::getline(input, line)) {
-            const std::string_view trimmed = trim(line);
-            if (trimmed.empty() || trimmed.front() == '#' || trimmed.front() == ';') {
-                continue;
-            }
-
-            const std::size_t equals = trimmed.find('=');
-            if (equals == std::string_view::npos) {
-                continue;
-            }
-
-            const std::string_view foundKey = trim(trimmed.substr(0, equals));
-            if (foundKey != key) {
-                continue;
-            }
-
-            std::string_view value = trim(trimmed.substr(equals + 1));
-            if (value.size() >= 2 &&
-                ((value.front() == '"' && value.back() == '"') ||
-                 (value.front() == '\'' && value.back() == '\''))) {
-                value.remove_prefix(1);
-                value.remove_suffix(1);
-            }
-
-            compile(std::string(value));
-            return;
-        }
-
-        throw std::runtime_error(
-            "Configuration key '" + std::string(key) + "' was not found in " + file.string());
-    }
-
     [[nodiscard]] double evaluate(std::span<const double> variableValues) const {
         if (code_.empty()) {
             throw EvaluationError("No formula has been compiled");
@@ -212,15 +172,12 @@ public:
             case Operation::PushConstant:
                 stack.push_back(instruction.literal);
                 break;
-
             case Operation::PushVariable:
                 stack.push_back(variableValues[instruction.argument]);
                 break;
-
             case Operation::Negate:
                 stack.push_back(-pop());
                 break;
-
             case Operation::Add: {
                 const double right = pop();
                 const double left = pop();
@@ -564,8 +521,7 @@ private:
             parsePower();
         }
 
-        // Right associative: 2^3^2 == 2^(3^2). Unary minus has lower
-        // precedence on the left, so -2^2 == -(2^2), but 2^-2 is valid.
+        // Right associative: 2^3^2 == 2^(3^2).
         void parsePower() {
             parsePrimary();
             if (match(TokenType::Caret)) {
@@ -727,16 +683,6 @@ private:
         }
     }
 
-    static std::string_view trim(std::string_view text) {
-        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
-            text.remove_prefix(1);
-        }
-        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
-            text.remove_suffix(1);
-        }
-        return text;
-    }
-
     [[nodiscard]] std::size_t calculateMaximumStackDepth() const {
         std::size_t depth = 0;
         std::size_t maximum = 0;
@@ -755,7 +701,7 @@ private:
             case Operation::Divide:
             case Operation::Modulo:
             case Operation::Power:
-                --depth; // two operands become one result
+                --depth;
                 break;
             case Operation::Call:
                 depth = depth - instruction.argumentCount + 1;
@@ -775,4 +721,553 @@ private:
     std::vector<std::string> variableNames_;
     std::unordered_map<std::string, std::size_t> variableLookup_;
     std::size_t maximumStackDepth_{};
+};
+
+// Manages a graph of named values and named formulas.
+//
+// Resolution order for a name:
+//   1. Explicit literal set with setValue()
+//   2. Expression set with setExpression()
+//   3. Optional external resolver callback
+//
+// Values and formulas replace one another by name, making later config/CLI
+// assignments natural overrides. Circular references are detected at runtime.
+class FormulaEngine {
+public:
+    using NativeFunction = MathFormula::NativeFunction;
+    using ValueResolver = std::function<std::optional<double>(std::string_view)>;
+
+    class Error : public std::runtime_error {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
+    FormulaEngine() = default;
+
+    void setMainExpression(std::string expression) {
+        main_ = compileExpression(std::move(expression));
+    }
+
+    void setValue(std::string name, double value) {
+        validateIdentifier(name);
+        expressions_.erase(name);
+        values_[std::move(name)] = value;
+    }
+
+    // The right-hand side may be a literal ("42") or an arbitrary formula.
+    void setExpression(std::string name, std::string expression) {
+        validateIdentifier(name);
+        CompiledExpression compiled = compileExpression(std::move(expression));
+        values_.erase(name);
+        expressions_[std::move(name)] = std::move(compiled);
+    }
+
+    // Convenience for dynamic name=expression input.
+    void setAssignment(std::string_view assignment) {
+        const auto [name, expression] = splitAssignment(assignment);
+        setExpression(name, expression);
+    }
+
+    void erase(std::string_view name) {
+        values_.erase(std::string(name));
+        expressions_.erase(std::string(name));
+    }
+
+    void clearVariables() {
+        values_.clear();
+        expressions_.clear();
+    }
+
+    void clear() {
+        clearVariables();
+        main_.reset();
+    }
+
+    [[nodiscard]] bool contains(std::string_view name) const {
+        const std::string key(name);
+        return values_.contains(key) || expressions_.contains(key);
+    }
+
+    void setValueResolver(ValueResolver resolver) {
+        resolver_ = std::move(resolver);
+    }
+
+    void registerConstant(std::string name, double value) {
+        validateIdentifier(name);
+        customConstants_[name] = value;
+        if (main_) {
+            main_->formula.registerConstant(name, value);
+            main_->formula.compile(main_->source);
+        }
+        for (auto& [_, expression] : expressions_) {
+            expression.formula.registerConstant(name, value);
+            expression.formula.compile(expression.source);
+        }
+    }
+
+    void registerFunction(
+        std::string name,
+        std::size_t minimumArguments,
+        std::size_t maximumArguments,
+        NativeFunction function) {
+
+        validateIdentifier(name);
+        if (!function) {
+            throw std::invalid_argument("Function callback cannot be empty");
+        }
+        if (minimumArguments > maximumArguments) {
+            throw std::invalid_argument("Minimum argument count exceeds maximum argument count");
+        }
+        FunctionRegistration registration{
+            .name = name,
+            .minimumArguments = minimumArguments,
+            .maximumArguments = maximumArguments,
+            .callback = std::move(function)
+        };
+        customFunctions_[name] = registration;
+        applyFunctionRegistration(main_, registration);
+        for (auto& [_, expression] : expressions_) {
+            applyFunctionRegistration(expression, registration);
+        }
+    }
+
+    // INI-style configuration:
+    //
+    //   [program]
+    //   formula = grand_total
+    //
+    //   [values]
+    //   price = 19.95
+    //
+    //   [variables]
+    //   subtotal = price * quantity
+    //   grand_total = subtotal + tax
+    //
+    // [variables], [expressions], and [formulas] all accept expressions.
+    // [values] requires numeric literals. A top-level "formula=" is also accepted.
+    void loadFromConfig(const std::filesystem::path& file, bool clearExisting = false) {
+        std::ifstream input(file);
+        if (!input) {
+            throw Error("Could not open configuration file: " + file.string());
+        }
+        if (clearExisting) {
+            clear();
+        }
+
+        std::string section;
+        std::string line;
+        std::size_t lineNumber = 0;
+
+        while (std::getline(input, line)) {
+            ++lineNumber;
+            std::string_view text = trim(line);
+            if (text.empty() || text.front() == '#' || text.front() == ';') {
+                continue;
+            }
+
+            if (text.front() == '[') {
+                if (text.back() != ']') {
+                    throw Error(location(file, lineNumber) + "Malformed section header");
+                }
+                section = lower(trim(text.substr(1, text.size() - 2)));
+                continue;
+            }
+
+            const std::size_t equals = text.find('=');
+            if (equals == std::string_view::npos) {
+                throw Error(location(file, lineNumber) + "Expected name=expression");
+            }
+
+            const std::string name(trim(text.substr(0, equals)));
+            const std::string value(unquote(trim(text.substr(equals + 1))));
+            if (name.empty() || value.empty()) {
+                throw Error(location(file, lineNumber) + "Empty name or expression");
+            }
+
+            try {
+                if (section.empty() || section == "program" || section == "main") {
+                    const std::string key = lower(name);
+                    if (key == "formula" || key == "expression" || key == "result") {
+                        setMainExpression(value);
+                    } else if (section.empty()) {
+                        // Convenient top-level definitions are allowed too.
+                        setExpression(name, value);
+                    } else {
+                        throw Error("Unknown program key '" + name + "'");
+                    }
+                } else if (section == "values") {
+                    setValue(name, parseNumber(value));
+                } else if (section == "variables" ||
+                           section == "expressions" ||
+                           section == "formulas") {
+                    setExpression(name, value);
+                } else {
+                    throw Error("Unknown configuration section [" + section + "]");
+                }
+            } catch (const std::exception& error) {
+                throw Error(location(file, lineNumber) + error.what());
+            }
+        }
+
+        if (!main_) {
+            throw Error("Configuration did not define [program] formula=...");
+        }
+    }
+
+    // Command-line syntax. Configuration files are loaded first; all other
+    // arguments are then applied in argument order, so CLI assignments override config.
+    //
+    //   --config FILE
+    //   --formula EXPRESSION
+    //   --set NAME=EXPRESSION
+    //   --value NAME=NUMBER
+    //   NAME=EXPRESSION                 (shorthand for --set)
+    void applyCommandLine(int argc, const char* const argv[]) {
+        std::vector<std::filesystem::path> configFiles;
+        for (int i = 1; i < argc; ++i) {
+            const std::string_view argument(argv[i]);
+            if (argument == "--config" || argument == "-c") {
+                requireNext(i, argc, argument);
+                configFiles.emplace_back(argv[++i]);
+            } else if (startsWith(argument, "--config=")) {
+                configFiles.emplace_back(std::string(argument.substr(9)));
+            }
+        }
+        for (const auto& file : configFiles) {
+            loadFromConfig(file, false);
+        }
+
+        for (int i = 1; i < argc; ++i) {
+            const std::string_view argument(argv[i]);
+            if (argument == "--config" || argument == "-c") {
+                ++i;
+                continue;
+            }
+            if (startsWith(argument, "--config=")) {
+                continue;
+            }
+            if (argument == "--formula" || argument == "-f") {
+                requireNext(i, argc, argument);
+                setMainExpression(argv[++i]);
+                continue;
+            }
+            if (startsWith(argument, "--formula=")) {
+                setMainExpression(std::string(argument.substr(10)));
+                continue;
+            }
+            if (argument == "--set" || argument == "-s") {
+                requireNext(i, argc, argument);
+                setAssignment(argv[++i]);
+                continue;
+            }
+            if (startsWith(argument, "--set=")) {
+                setAssignment(argument.substr(6));
+                continue;
+            }
+            if (argument == "--value" || argument == "-v") {
+                requireNext(i, argc, argument);
+                applyLiteralAssignment(argv[++i]);
+                continue;
+            }
+            if (startsWith(argument, "--value=")) {
+                applyLiteralAssignment(argument.substr(8));
+                continue;
+            }
+            if (argument == "--help" || argument == "-h") {
+                continue;
+            }
+            if (!argument.empty() && argument.front() == '-') {
+                throw Error("Unknown command-line option: " + std::string(argument));
+            }
+            if (argument.find('=') != std::string_view::npos) {
+                setAssignment(argument);
+                continue;
+            }
+            throw Error("Unexpected command-line argument: " + std::string(argument));
+        }
+    }
+
+    [[nodiscard]] double evaluate() const {
+        if (!main_) {
+            throw Error("No main formula has been configured");
+        }
+        EvaluationContext context;
+        return evaluateCompiled(*main_, context, "<main>");
+    }
+
+    [[nodiscard]] double evaluateName(std::string_view name) const {
+        EvaluationContext context;
+        return resolve(name, context);
+    }
+
+    [[nodiscard]] double evaluateExpression(std::string expression) const {
+        const CompiledExpression temporary = compileExpression(std::move(expression));
+        EvaluationContext context;
+        return evaluateCompiled(temporary, context, "<temporary>");
+    }
+
+    [[nodiscard]] std::vector<std::string> names() const {
+        std::vector<std::string> result;
+        result.reserve(values_.size() + expressions_.size());
+        for (const auto& [name, _] : values_) {
+            result.push_back(name);
+        }
+        for (const auto& [name, _] : expressions_) {
+            result.push_back(name);
+        }
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+
+    [[nodiscard]] const std::string& mainSource() const {
+        if (!main_) {
+            throw Error("No main formula has been configured");
+        }
+        return main_->source;
+    }
+
+private:
+    struct CompiledExpression {
+        std::string source;
+        MathFormula formula;
+    };
+
+    struct FunctionRegistration {
+        std::string name;
+        std::size_t minimumArguments{};
+        std::size_t maximumArguments{};
+        NativeFunction callback;
+    };
+
+    struct EvaluationContext {
+        std::unordered_map<std::string, double> memo;
+        std::unordered_set<std::string> active;
+        std::vector<std::string> chain;
+    };
+
+    [[nodiscard]] CompiledExpression compileExpression(std::string expression) const {
+        CompiledExpression compiled;
+        compiled.source = std::move(expression);
+        applyRegistrations(compiled.formula);
+        compiled.formula.compile(compiled.source);
+        return compiled;
+    }
+
+    void applyRegistrations(MathFormula& formula) const {
+        for (const auto& [name, value] : customConstants_) {
+            formula.registerConstant(name, value);
+        }
+        for (const auto& [_, function] : customFunctions_) {
+            formula.registerFunction(
+                function.name,
+                function.minimumArguments,
+                function.maximumArguments,
+                function.callback);
+        }
+    }
+
+    static void applyFunctionRegistration(
+        std::optional<CompiledExpression>& expression,
+        const FunctionRegistration& registration) {
+        if (!expression) {
+            return;
+        }
+        applyFunctionRegistration(*expression, registration);
+    }
+
+    static void applyFunctionRegistration(
+        CompiledExpression& expression,
+        const FunctionRegistration& registration) {
+        expression.formula.registerFunction(
+            registration.name,
+            registration.minimumArguments,
+            registration.maximumArguments,
+            registration.callback);
+        expression.formula.compile(expression.source);
+    }
+
+    [[nodiscard]] double evaluateCompiled(
+        const CompiledExpression& expression,
+        EvaluationContext& context,
+        std::string_view label) const {
+
+        std::vector<double> variables;
+        variables.reserve(expression.formula.variables().size());
+        for (const std::string& dependency : expression.formula.variables()) {
+            try {
+                variables.push_back(resolve(dependency, context));
+            } catch (const Error&) {
+                throw;
+            } catch (const std::exception& error) {
+                throw Error(
+                    "While evaluating '" + std::string(label) + "': " + error.what());
+            }
+        }
+
+        try {
+            return expression.formula.evaluate(variables);
+        } catch (const std::exception& error) {
+            throw Error("While evaluating '" + std::string(label) + "': " + error.what());
+        }
+    }
+
+    [[nodiscard]] double resolve(std::string_view requestedName, EvaluationContext& context) const {
+        const std::string name(requestedName);
+
+        if (const auto memoized = context.memo.find(name); memoized != context.memo.end()) {
+            return memoized->second;
+        }
+
+        if (const auto literal = values_.find(name); literal != values_.end()) {
+            context.memo[name] = literal->second;
+            return literal->second;
+        }
+
+        if (const auto expression = expressions_.find(name); expression != expressions_.end()) {
+            if (context.active.contains(name)) {
+                std::ostringstream message;
+                message << "Circular formula dependency: ";
+                const auto first = std::find(context.chain.begin(), context.chain.end(), name);
+                for (auto it = first; it != context.chain.end(); ++it) {
+                    if (it != first) {
+                        message << " -> ";
+                    }
+                    message << *it;
+                }
+                message << " -> " << name;
+                throw Error(message.str());
+            }
+
+            context.active.insert(name);
+            context.chain.push_back(name);
+            try {
+                const double result = evaluateCompiled(expression->second, context, name);
+                context.chain.pop_back();
+                context.active.erase(name);
+                context.memo[name] = result;
+                return result;
+            } catch (...) {
+                context.chain.pop_back();
+                context.active.erase(name);
+                throw;
+            }
+        }
+
+        if (resolver_) {
+            if (const std::optional<double> resolved = resolver_(name)) {
+                context.memo[name] = *resolved;
+                return *resolved;
+            }
+        }
+
+        std::ostringstream message;
+        message << "Missing variable '" << name << "'";
+        if (!context.chain.empty()) {
+            message << " required by ";
+            for (std::size_t i = 0; i < context.chain.size(); ++i) {
+                if (i != 0) {
+                    message << " -> ";
+                }
+                message << context.chain[i];
+            }
+        }
+        throw Error(message.str());
+    }
+
+    void applyLiteralAssignment(std::string_view assignment) {
+        const auto [name, value] = splitAssignment(assignment);
+        setValue(name, parseNumber(value));
+    }
+
+    static std::pair<std::string, std::string> splitAssignment(std::string_view assignment) {
+        const std::size_t equals = assignment.find('=');
+        if (equals == std::string_view::npos) {
+            throw Error("Expected NAME=EXPRESSION, received: " + std::string(assignment));
+        }
+        const std::string name(trim(assignment.substr(0, equals)));
+        const std::string expression(unquote(trim(assignment.substr(equals + 1))));
+        if (name.empty() || expression.empty()) {
+            throw Error("Empty name or expression in assignment: " + std::string(assignment));
+        }
+        return {name, expression};
+    }
+
+    static double parseNumber(std::string_view text) {
+        const std::string value(trim(text));
+        std::size_t consumed = 0;
+        try {
+            const double result = std::stod(value, &consumed);
+            if (consumed != value.size()) {
+                throw Error("Expected a numeric literal, received: " + value);
+            }
+            return result;
+        } catch (const Error&) {
+            throw;
+        } catch (const std::exception&) {
+            throw Error("Expected a numeric literal, received: " + value);
+        }
+    }
+
+    static void requireNext(int index, int argc, std::string_view option) {
+        if (index + 1 >= argc) {
+            throw Error("Missing value after " + std::string(option));
+        }
+    }
+
+    static bool startsWith(std::string_view value, std::string_view prefix) {
+        return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
+    }
+
+    static std::string location(const std::filesystem::path& file, std::size_t line) {
+        return file.string() + ":" + std::to_string(line) + ": ";
+    }
+
+    static std::string lower(std::string_view value) {
+        std::string result(value);
+        std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return result;
+    }
+
+    static std::string_view trim(std::string_view text) {
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+            text.remove_prefix(1);
+        }
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+            text.remove_suffix(1);
+        }
+        return text;
+    }
+
+    static std::string_view unquote(std::string_view text) {
+        if (text.size() >= 2 &&
+            ((text.front() == '"' && text.back() == '"') ||
+             (text.front() == '\'' && text.back() == '\''))) {
+            text.remove_prefix(1);
+            text.remove_suffix(1);
+        }
+        return text;
+    }
+
+    static void validateIdentifier(std::string_view name) {
+        if (name.empty() ||
+            !(std::isalpha(static_cast<unsigned char>(name.front())) || name.front() == '_')) {
+            throw std::invalid_argument("Invalid identifier: " + std::string(name));
+        }
+        for (const char character : name.substr(1)) {
+            const unsigned char value = static_cast<unsigned char>(character);
+            if (!std::isalnum(value) && character != '_') {
+                throw std::invalid_argument("Invalid identifier: " + std::string(name));
+            }
+        }
+    }
+
+    std::optional<CompiledExpression> main_;
+    std::unordered_map<std::string, double> values_;
+    std::unordered_map<std::string, CompiledExpression> expressions_;
+    ValueResolver resolver_;
+
+    std::unordered_map<std::string, double> customConstants_;
+    std::unordered_map<std::string, FunctionRegistration> customFunctions_;
 };

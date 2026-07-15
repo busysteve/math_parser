@@ -1,53 +1,75 @@
 #include "math_formula.hpp"
 
+#include <iomanip>
 #include <iostream>
 #include <span>
-#include <unordered_map>
-#include <vector>
+#include <string_view>
 
-int main() {
+namespace {
+void printHelp(std::string_view executable) {
+    std::cout
+        << "Usage:\n"
+        << "  " << executable << " --config FILE [overrides...]\n"
+        << "  " << executable << " --formula EXPR NAME=EXPR ...\n\n"
+        << "Options:\n"
+        << "  -c, --config FILE          Load an INI configuration\n"
+        << "  -f, --formula EXPR         Set/replace the main formula\n"
+        << "  -s, --set NAME=EXPR        Set a value or computed variable\n"
+        << "  -v, --value NAME=NUMBER    Set a strict numeric value\n"
+        << "  NAME=EXPR                  Shorthand for --set NAME=EXPR\n\n"
+        << "Examples:\n"
+        << "  " << executable << " --config settings.ini\n"
+        << "  " << executable << " --config settings.ini price=25 quantity=4\n"
+        << "  " << executable
+        << " --config settings.ini --set 'shipping=subtotal*0.10'\n"
+        << "  " << executable
+        << " --formula 'area*unit_cost' 'area=width*height' width=8 height=5 unit_cost=3.25\n";
+}
+} // namespace
+
+int main(int argc, const char* argv[]) {
     try {
-        MathFormula formula;
+        if (argc == 1) {
+            printHelp(argv[0]);
+            return 0;
+        }
+        for (int i = 1; i < argc; ++i) {
+            if (std::string_view(argv[i]) == "--help" ||
+                std::string_view(argv[i]) == "-h") {
+                printHelp(argv[0]);
+                return 0;
+            }
+        }
 
-        // Optional application-defined function.
-        formula.registerFunction("lerp", 3, 3, [](std::span<const double> a) {
+        FormulaEngine engine;
+
+        // Application-defined functions work inside the main formula and all
+        // variable expressions, regardless of whether they came from code,
+        // configuration, or command line.
+        engine.registerFunction("lerp", 3, 3, [](std::span<const double> a) {
             return a[0] + (a[1] - a[0]) * a[2];
         });
 
-        // Or use:
-        // formula.compileFromConfig("settings.ini", "formula");
-        formula.compile("clamp(base * (1 + rate)^years + sin(t), 0, limit)");
+        // Code-created expressions are dynamic too. A config or CLI assignment
+        // with the same name replaces this definition.
+        engine.setExpression("service_fee", "subtotal * 0.015");
 
-        // Convenient evaluation using names.
-        const std::unordered_map<std::string, double> variables{
-            {"base", 1000.0},
-            {"rate", 0.05},
-            {"years", 10.0},
-            {"t", 0.5},
-            {"limit", 2000.0}
-        };
-        std::cout << "Named evaluation: " << formula.evaluate(variables) << '\n';
+        // Parses --config, --formula, --set, --value, and bare NAME=EXPR.
+        // Config is loaded first so command-line assignments always win.
+        engine.applyCommandLine(argc, argv);
 
-        // Faster repeated evaluation: resolve variable indexes once.
-        std::vector<double> runtimeValues(formula.variables().size());
-        const auto baseIndex = formula.variableIndex("base");
-        const auto rateIndex = formula.variableIndex("rate");
-        const auto yearsIndex = formula.variableIndex("years");
-        const auto timeIndex = formula.variableIndex("t");
-        const auto limitIndex = formula.variableIndex("limit");
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "Formula: " << engine.mainSource() << '\n';
+        std::cout << "Result:  " << engine.evaluate() << '\n';
 
-        runtimeValues[baseIndex] = 1000.0;
-        runtimeValues[rateIndex] = 0.05;
-        runtimeValues[yearsIndex] = 10.0;
-        runtimeValues[limitIndex] = 2000.0;
-
-        for (int frame = 0; frame < 5; ++frame) {
-            runtimeValues[timeIndex] = frame * 0.1;
-            std::cout << "Frame " << frame << ": "
-                      << formula.evaluate(runtimeValues) << '\n';
+        // Any named expression can also be evaluated directly.
+        if (engine.contains("subtotal")) {
+            std::cout << "Subtotal: " << engine.evaluateName("subtotal") << '\n';
         }
+
+        return 0;
     } catch (const MathFormula::CompileError& error) {
-        std::cerr << "Formula error: " << error.what() << '\n';
+        std::cerr << "Formula syntax error: " << error.what() << '\n';
         return 1;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';

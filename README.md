@@ -1,95 +1,128 @@
-# Dynamic C++ Math Formula Parser
+# Dynamic C++ Formula Engine
 
-`MathFormula` compiles expressions once and evaluates them repeatedly. The top-level formula and the variables it uses are discovered dynamically; the application does not need a hard-coded variable list.
+This C++20 header compiles mathematical expressions and resolves a graph of named values and formulas at runtime.
 
-## Formula-valued variables
+A variable does not have to be a hard-coded number. It can be another formula, which can reference more formulas:
 
-Every entry under `[variables]` may be a literal number or another formula:
+```text
+subtotal   = price * quantity
+discount   = max(0, subtotal * discount_rate)
+taxable    = subtotal - discount
+tax        = taxable * tax_rate
+grand_total = taxable + tax + shipping
+```
+
+The engine resolves dependencies automatically, caches repeated dependencies during each evaluation, reports missing variables, and detects circular references such as `a=b+1` and `b=a+1`.
+
+## Configuration
 
 ```ini
+[program]
 formula = grand_total
 
-[variables]
-unit_price = 19.95
+[values]
+price = 19.95
 quantity = 3
-subtotal = unit_price * quantity
 tax_rate = 0.07
+
+[variables]
+subtotal = price * quantity
 tax = subtotal * tax_rate
-shipping = max(4.99, subtotal * 0.05)
-grand_total = subtotal + tax + shipping
+grand_total = subtotal + tax
 ```
 
+`[values]` accepts strict numeric literals. `[variables]`, `[expressions]`, and `[formulas]` accept full expressions. Definitions may appear in any order.
+
 ```cpp
-MathFormula formula;
-formula.loadFromConfig("settings.ini");
-const double result = formula.evaluate();
+FormulaEngine engine;
+engine.loadFromConfig("settings.ini");
+std::cout << engine.evaluate() << '\n';
 ```
 
-Dependencies are resolved automatically. Formula-valued variables are evaluated lazily and cached for the duration of each `evaluate()` call.
-
-## Runtime formulas and values
+## Definitions from code
 
 ```cpp
-formula.setVariable("quantity", 5.0);
-formula.setVariableFormula("discount", "subtotal * 0.10");
-formula.compile("grand_total - discount");
+FormulaEngine engine;
 
-const double result = formula.evaluate();
+engine.setMainExpression("grand_total");
+engine.setValue("price", 19.95);
+engine.setValue("quantity", 3);
+engine.setExpression("subtotal", "price * quantity");
+engine.setExpression("tax", "subtotal * tax_rate");
+engine.setExpression("grand_total", "subtotal + tax");
+engine.setValue("tax_rate", 0.07);
+
+std::cout << engine.evaluate() << '\n';
 ```
 
-A direct value replaces a formula with the same name, and a formula replaces a direct value with the same name.
-
-Runtime values may override configured values or formulas for one evaluation:
+Dynamic `name=expression` text can be applied without knowing the name in advance:
 
 ```cpp
-MathFormula::VariableMap overrides{
-    {"quantity", 10.0},
-    {"tax_rate", 0.08}
-};
-
-const double result = formula.evaluate(overrides);
+engine.setAssignment(runtimeText); // for example: "shipping=max(5,subtotal*.03)"
 ```
 
-## Live value resolver
+## Definitions from the command line
 
-A resolver can provide otherwise undefined values from sensors, databases, environment variables, or application state:
+```bash
+./formula_example --config settings.ini
+```
+
+Override configured values or formulas:
+
+```bash
+./formula_example --config settings.ini price=25 quantity=4
+./formula_example --config settings.ini --set 'shipping=subtotal*0.10'
+./formula_example --config settings.ini --value tax_rate=0.08
+```
+
+Build an entire formula graph from command-line arguments:
+
+```bash
+./formula_example \
+  --formula 'area*unit_cost' \
+  'area=width*height' \
+  width=8 \
+  height=5 \
+  unit_cost=3.25
+```
+
+All bare `NAME=EXPRESSION` arguments and `--set` arguments are compiled as expressions. `--value` requires a plain number.
+
+Command-line assignments override configuration definitions with the same name.
+
+## Live external values
+
+Names not defined in code/config/CLI can be supplied by a callback:
 
 ```cpp
-formula.setVariableResolver(
-    [](std::string_view name) -> std::optional<double> {
-        if (name == "temperature") {
-            return readTemperatureSensor();
-        }
-        return std::nullopt;
+engine.setValueResolver(
+    [&](std::string_view name) -> std::optional<double> {
+        return sensorDatabase.lookup(name);
     });
 ```
 
-Resolution priority is:
-
-1. Per-call runtime overrides
-2. Stored numeric values
-3. Stored formula-valued variables
-4. Live resolver
-
-## Circular dependencies
-
-Cycles are rejected during evaluation:
+## Custom functions
 
 ```cpp
-formula.setVariableFormula("a", "b + 1");
-formula.setVariableFormula("b", "a + 1");
+engine.registerFunction("lerp", 3, 3, [](std::span<const double> a) {
+    return a[0] + (a[1] - a[0]) * a[2];
+});
 ```
 
-This produces an error such as:
+Custom functions are available to the main expression and every variable expression.
 
-```text
-Circular variable formula dependency: a -> b -> a
-```
+## Supported syntax
+
+- Operators: `+ - * / % ^`
+- Parentheses and unary `+`/`-`
+- Scientific notation such as `1.5e-4`
+- Constants: `pi`, `e`
+- Functions: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `sqrt`, `abs`, `exp`, `log`, `log10`, `floor`, `ceil`, `round`, `pow`, `min`, `max`, `clamp`
 
 ## Build
 
 ```bash
 cmake -S . -B build
 cmake --build build
-./build/math_formula_example settings.ini
+./build/formula_example --config settings.ini
 ```
